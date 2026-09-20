@@ -1,0 +1,581 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Media;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+namespace AuraApp
+{
+    static class Program
+    {
+        // ---------- Win32 API ----------
+
+        [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW",
+            CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SystemParametersInfo(
+            uint uAction, uint uParam, string lpvParam, uint fuWinIni);
+
+        [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW",
+            CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SystemParametersInfo(
+            uint uAction, uint uParam, StringBuilder lpvParam, uint fuWinIni);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+        private static extern void SHChangeNotify(
+            uint wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern uint GetShortPathName(
+            string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+
+        // ---------- Константы ----------
+
+        private const uint SPI_SETDESKWALLPAPER = 20;
+        private const uint SPI_GETDESKWALLPAPER = 0x0073;
+        private const uint SPIF_UPDATEINIFILE   = 0x01;
+        private const uint SPIF_SENDCHANGE      = 0x02;
+
+        private const uint SHCNE_ASSOCCHANGED   = 0x08000000;
+        private const uint SHCNF_IDLIST         = 0x0000;
+
+        // ---------- Состояние ----------
+
+        static List<Form> activeWindows = new List<Form>();
+        static readonly object lockObj = new object();
+
+        static string originalWallpaper = "";
+        static string originalWallpaperStyle = "2";
+        static string originalTileWallpaper = "0";
+
+        static List<string> desktopDirs = new List<string>();
+
+        static bool cleanedUp = false;
+        static readonly object cleanupLock = new object();
+
+        static Stream GetResource(string name)
+        {
+            return typeof(Program).Assembly.GetManifestResourceStream(name);
+        }
+
+        static void ExtractResource(string resourceName, string targetPath)
+        {
+            try
+            {
+                using (Stream s = GetResource(resourceName))
+                {
+                    if (s == null) return;
+                    using (FileStream fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write))
+                    {
+                        byte[] buf = new byte[65536];
+                        int read;
+                        while ((read = s.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            fs.Write(buf, 0, read);
+                        }
+                    }
+                }
+            }
+            catch {}
+        }
+
+        static Image LoadResourceImage(string resourceName, string fallbackPath)
+        {
+            try
+            {
+                using (Stream s = GetResource(resourceName))
+                {
+                    if (s != null)
+                    {
+                        using (Image temp = Image.FromStream(s))
+                        {
+                            return new Bitmap(temp);
+                        }
+                    }
+                }
+            }
+            catch {}
+
+            if (!string.IsNullOrEmpty(fallbackPath) && File.Exists(fallbackPath))
+            {
+                try
+                {
+                    using (Image temp = Image.FromFile(fallbackPath))
+                    {
+                        return new Bitmap(temp);
+                    }
+                }
+                catch {}
+            }
+
+            return null;
+        }
+
+        private static void SaveOriginalWallpaperSettings()
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder(260);
+                if (SystemParametersInfo(SPI_GETDESKWALLPAPER, (uint)sb.Capacity, sb, 0))
+                {
+                    originalWallpaper = sb.ToString();
+                }
+
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop", false))
+                {
+                    if (key != null)
+                    {
+                        object style = key.GetValue("WallpaperStyle");
+                        object tile  = key.GetValue("TileWallpaper");
+                        if (style != null) originalWallpaperStyle = style.ToString();
+                        if (tile  != null) originalTileWallpaper  = tile.ToString();
+                    }
+                }
+            }
+            catch {}
+        }
+
+        public static bool SetWallpaper(string imagePath, string wallpaperStyle = "2", string tile = "0")
+        {
+            if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath))
+                return false;
+
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("WallpaperStyle", wallpaperStyle);
+                        key.SetValue("TileWallpaper", tile);
+                    }
+                }
+
+                string path = imagePath;
+                if (path.IndexOfAny(new[] { ' ', '\t' }) >= 0 || ContainsNonAscii(path))
+                {
+                    StringBuilder shortPath = new StringBuilder(260);
+                    if (GetShortPathName(path, shortPath, (uint)shortPath.Capacity) > 0)
+                        path = shortPath.ToString();
+                }
+
+                bool ok = SystemParametersInfo(
+                    SPI_SETDESKWALLPAPER, 0, path,
+                    SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+                return ok;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static void RestoreOriginalWallpaper()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("WallpaperStyle", originalWallpaperStyle);
+                        key.SetValue("TileWallpaper", originalTileWallpaper);
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(originalWallpaper))
+                {
+                    SystemParametersInfo(
+                        SPI_SETDESKWALLPAPER, 0, originalWallpaper,
+                        SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+                }
+                else
+                {
+                    SystemParametersInfo(
+                        SPI_SETDESKWALLPAPER, 0, "",
+                        SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+                }
+
+                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+            }
+            catch {}
+        }
+
+        private static bool ContainsNonAscii(string s)
+        {
+            foreach (char c in s)
+                if (c > 127) return true;
+            return false;
+        }
+
+        static void SpawnErrorDialog(string lyricsLine, int x, int y)
+        {
+            Thread t = new Thread(() =>
+            {
+                try
+                {
+                    Form errForm = new Form();
+                    errForm.Text = "AURA.exe - Fatal Error";
+                    errForm.FormBorderStyle = FormBorderStyle.FixedDialog;
+                    errForm.MaximizeBox = false;
+                    errForm.MinimizeBox = false;
+                    errForm.StartPosition = FormStartPosition.Manual;
+                    errForm.Location = new Point(x, y);
+                    errForm.Size = new Size(430, 165);
+                    errForm.TopMost = true;
+                    errForm.ShowIcon = true;
+
+                    PictureBox iconBox = new PictureBox();
+                    iconBox.Image = SystemIcons.Error.ToBitmap();
+                    iconBox.Location = new Point(20, 25);
+                    iconBox.Size = new Size(32, 32);
+                    iconBox.SizeMode = PictureBoxSizeMode.StretchImage;
+                    errForm.Controls.Add(iconBox);
+
+                    Label lbl = new Label();
+                    lbl.Text = lyricsLine;
+                    lbl.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+                    lbl.ForeColor = Color.Red;
+                    lbl.Location = new Point(65, 20);
+                    lbl.Size = new Size(340, 55);
+                    errForm.Controls.Add(lbl);
+
+                    Button btn = new Button();
+                    btn.Text = "OK";
+                    btn.Location = new Point(170, 85);
+                    btn.Size = new Size(90, 30);
+                    btn.Click += (s, e) => errForm.Close();
+                    errForm.Controls.Add(btn);
+
+                    // Timer to keep error window above fullscreen overlay
+                    System.Windows.Forms.Timer topTimer = new System.Windows.Forms.Timer();
+                    topTimer.Interval = 200;
+                    topTimer.Tick += (s, e) =>
+                    {
+                        if (!errForm.IsDisposed && errForm.IsHandleCreated)
+                        {
+                            SetWindowPos(errForm.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                        }
+                    };
+
+                    errForm.Load += (s, e) => topTimer.Start();
+                    errForm.FormClosed += (s, e) => topTimer.Stop();
+
+                    lock (lockObj)
+                    {
+                        activeWindows.Add(errForm);
+                    }
+
+                    try { SystemSounds.Hand.Play(); } catch {}
+
+                    Application.Run(errForm);
+                }
+                catch {}
+            });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        static void ShowFullscreenJumpscare(List<Image> images)
+        {
+            if (images == null || images.Count == 0) return;
+
+            Thread t = new Thread(() =>
+            {
+                try
+                {
+                    Form fsForm = new Form();
+                    fsForm.FormBorderStyle = FormBorderStyle.None;
+                    fsForm.WindowState = FormWindowState.Normal;
+                    fsForm.StartPosition = FormStartPosition.Manual;
+                    fsForm.Bounds = Screen.PrimaryScreen.Bounds; // True fullscreen coverage
+                    fsForm.TopMost = true;
+                    fsForm.BackColor = Color.Black;
+                    fsForm.Cursor = Cursors.WaitCursor;
+
+                    PictureBox pb = new PictureBox();
+                    pb.Dock = DockStyle.Fill;
+                    pb.SizeMode = PictureBoxSizeMode.Zoom;
+                    pb.BackColor = Color.Black;
+                    pb.Image = images[0];
+                    fsForm.Controls.Add(pb);
+
+                    System.Windows.Forms.Timer cycleTimer = new System.Windows.Forms.Timer();
+                    cycleTimer.Interval = 350;
+                    int curIdx = 0;
+                    cycleTimer.Tick += (s, e) =>
+                    {
+                        curIdx = (curIdx + 1) % images.Count;
+                        pb.Image = images[curIdx];
+                    };
+                    cycleTimer.Start();
+
+                    lock (lockObj)
+                    {
+                        activeWindows.Add(fsForm);
+                    }
+
+                    Application.Run(fsForm);
+                }
+                catch {}
+            });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        public static void Cleanup()
+        {
+            lock (cleanupLock)
+            {
+                if (cleanedUp) return;
+                cleanedUp = true;
+            }
+
+            try
+            {
+                RestoreOriginalWallpaper();
+
+                // NOTE: User requested NOT to delete .txt files from desktop!
+                // So .txt files remain on the desktop.
+
+                // Закрываем активные окна
+                lock (lockObj)
+                {
+                    foreach (Form f in activeWindows)
+                    {
+                        try
+                        {
+                            if (f.InvokeRequired)
+                                f.Invoke(new Action(() => f.Close()));
+                            else
+                                f.Close();
+                        }
+                        catch {}
+                    }
+                    activeWindows.Clear();
+                }
+
+                string tempDir = Path.GetTempPath();
+                try { File.Delete(Path.Combine(tempDir, "aura_play.vbs")); } catch {}
+                try { File.Delete(Path.Combine(tempDir, "aura_music.mp3")); } catch {}
+                try { File.Delete(Path.Combine(tempDir, "aura_wallpaper.png")); } catch {}
+
+                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+            }
+            catch {}
+        }
+
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            SaveOriginalWallpaperSettings();
+
+            Application.ApplicationExit += (s, e) => Cleanup();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => Cleanup();
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => Cleanup();
+
+            try
+            {
+                RunPrank();
+            }
+            finally
+            {
+                Cleanup();
+            }
+        }
+
+        static void RunPrank()
+        {
+            string tempDir = Path.GetTempPath();
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string downloadsDir = Path.Combine(userProfile, "Downloads");
+
+            string oneDriveDesktop = Path.Combine(userProfile, @"OneDrive\Desktop");
+            if (Directory.Exists(oneDriveDesktop))
+                desktopDirs.Add(oneDriveDesktop);
+
+            string localDesktop = Path.Combine(userProfile, "Desktop");
+            if (Directory.Exists(localDesktop) && !desktopDirs.Contains(localDesktop))
+                desktopDirs.Add(localDesktop);
+
+            if (desktopDirs.Count == 0)
+                desktopDirs.Add(Environment.GetFolderPath(Environment.SpecialFolder.Desktop));
+
+            string extractedMusic = Path.Combine(tempDir, "aura_music.mp3");
+            string extractedWallpaper = Path.Combine(tempDir, "aura_wallpaper.png");
+
+            ExtractResource("music.mp3", extractedMusic);
+            ExtractResource("wallpaper.png", extractedWallpaper);
+
+            string musicPath = File.Exists(extractedMusic) ? extractedMusic : Path.Combine(downloadsDir, "TIKI TIKI.mp3");
+            string wallpaperPath = File.Exists(extractedWallpaper) ? extractedWallpaper : Path.Combine(downloadsDir, "1394671.png");
+
+            List<Image> trollImages = new List<Image>();
+            foreach (string fn in new string[] { "1.jpg", "2.jpg", "3.jpg" })
+            {
+                Image img = LoadResourceImage(fn, Path.Combine(downloadsDir, fn));
+                if (img != null)
+                {
+                    trollImages.Add(img);
+                }
+            }
+
+            // Установка обоев
+            if (File.Exists(wallpaperPath))
+            {
+                SetWallpaper(wallpaperPath);
+            }
+
+            // Воспроизведение музыки
+            string vbsPath = Path.Combine(tempDir, "aura_play.vbs");
+            Process musicProcess = null;
+
+            if (File.Exists(musicPath))
+            {
+                try
+                {
+                    string vbsCode = 
+                        "Set w = CreateObject(\"WMPlayer.OCX\")\r\n" +
+                        "w.settings.volume = 100\r\n" +
+                        "w.URL = \"" + musicPath.Replace("\\", "\\\\") + "\"\r\n" +
+                        "w.controls.play\r\n" +
+                        "While w.playState = 0 Or w.playState = 9 Or w.playState = 6\r\n" +
+                        "  WScript.Sleep 200\r\n" +
+                        "Wend\r\n" +
+                        "While w.playState = 3\r\n" +
+                        "  WScript.Sleep 500\r\n" +
+                        "Wend\r\n";
+
+                    File.WriteAllText(vbsPath, vbsCode, Encoding.ASCII);
+
+                    ProcessStartInfo psi = new ProcessStartInfo("wscript.exe", "\"" + vbsPath + "\"")
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    musicProcess = Process.Start(psi);
+                }
+                catch {}
+            }
+
+            // Заполнение всего рабочего стола .txt файлами (280 файлов по 10000 строк AURA)
+            StringBuilder sb = new StringBuilder();
+            for (int line = 0; line < 10000; line++)
+            {
+                sb.AppendLine("AURA");
+            }
+            string auraContent = sb.ToString();
+
+            const int totalFiles = 280; // Полное заполнение сетки рабочего стола (1920x1080 / 2K)
+            for (int i = 0; i < totalFiles; i++)
+            {
+                string fname = (i == 0) ? "AURA.txt" : string.Format("AURA ({0}).txt", i);
+                foreach (string dt in desktopDirs)
+                {
+                    string fpath = Path.Combine(dt, fname);
+                    try
+                    {
+                        File.WriteAllText(fpath, auraContent, Encoding.UTF8);
+                    }
+                    catch {}
+                }
+                if (i % 20 == 0)
+                {
+                    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+                }
+                Thread.Sleep(5);
+            }
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+
+            // Текст песни для окон ошибок
+            string[] lyrics = new string[]
+            {
+                "Tiki, tiki, tiki, mate teki takata.",
+                "Tiki, tiki, tiki, tiki, tiki.",
+                "Tiki, tiki, tiki, tiki, tiki takata.",
+                "Tiki, tiki, tiki, mate teki takata.",
+                "Tiki, tiki, tiki, mate teki takata.",
+                "Tiki, tiki, tiki, mate teki takata.",
+                "Tiki, tiki, tiki, tiki, tiki takata, takata, takata.",
+                "Tiki, tiki, tiki, mate teki takata.",
+                "Tiki, tiki, tiki, tiki, tiki takata."
+            };
+
+            Random rnd = new Random();
+            int screenW = Screen.PrimaryScreen.Bounds.Width;
+            int screenH = Screen.PrimaryScreen.Bounds.Height;
+
+            Stopwatch sw = Stopwatch.StartNew();
+            bool at15SecTriggered = false;
+            int lyricsIdx = 0;
+            long lastPopupTime = 0;
+
+            while (true)
+            {
+                Thread.Sleep(250);
+
+                long elapsed = sw.ElapsedMilliseconds;
+
+                if (musicProcess != null && musicProcess.HasExited)
+                {
+                    break;
+                }
+                if (elapsed >= 160000)
+                {
+                    break;
+                }
+
+                // Появление окон с текстом песни (поверх всего)
+                if (elapsed - lastPopupTime > 1500)
+                {
+                    lastPopupTime = elapsed;
+                    string curLine = lyrics[lyricsIdx % lyrics.Length];
+                    lyricsIdx++;
+
+                    int posX = rnd.Next(30, Math.Max(40, screenW - 460));
+                    int posY = rnd.Next(30, Math.Max(40, screenH - 240));
+
+                    SpawnErrorDialog(curLine, posX, posY);
+
+                    if (lyricsIdx % 2 == 0)
+                    {
+                        int posX2 = rnd.Next(30, Math.Max(40, screenW - 460));
+                        int posY2 = rnd.Next(30, Math.Max(40, screenH - 240));
+                        SpawnErrorDialog(curLine, posX2, posY2);
+                    }
+                }
+
+                // Через 15 секунд — полноэкранный скример (выше всех окон, но ошибки поднимаются над ним)
+                if (!at15SecTriggered && elapsed >= 15000)
+                {
+                    at15SecTriggered = true;
+
+                    if (trollImages.Count > 0)
+                    {
+                        ShowFullscreenJumpscare(trollImages);
+                    }
+                }
+            }
+        }
+    }
+}

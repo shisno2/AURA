@@ -37,6 +37,17 @@ namespace AuraApp
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        private static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_NOZORDER   = 0x0004;
+        private const int SW_HIDE         = 0;
+
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private const uint SWP_NOMOVE = 0x0002;
         private const uint SWP_NOSIZE = 0x0001;
@@ -51,6 +62,13 @@ namespace AuraApp
 
         private const uint SHCNE_ASSOCCHANGED   = 0x08000000;
         private const uint SHCNF_IDLIST         = 0x0000;
+
+        // Максимум одновременно открытых окон-ошибок (лишние закрываются автоматически)
+        private const int MAX_ERROR_DIALOGS = 4;
+
+        // Текст первой ошибки и троллфейс-старт
+        private const string FirstErrorMessage = "ну всё пк 200";
+        private const long FirstErrorDurationMs = 3000;
 
         // ---------- Состояние ----------
 
@@ -223,8 +241,42 @@ namespace AuraApp
             return false;
         }
 
+        static void EnforceDialogLimit()
+        {
+            lock (lockObj)
+            {
+                // Оставляем место для нового окна: закрываем самые старые
+                while (activeWindows.Count >= MAX_ERROR_DIALOGS)
+                {
+                    Form oldest = activeWindows[0];
+                    activeWindows.RemoveAt(0);
+                    CloseFormSafe(oldest);
+                }
+            }
+        }
+
+        static void CloseFormSafe(Form f)
+        {
+            try
+            {
+                if (f.IsDisposed) return;
+                if (f.InvokeRequired)
+                    f.BeginInvoke(new Action(() => { try { f.Close(); } catch {} }));
+                else
+                    f.Close();
+            }
+            catch {}
+        }
+
         static void SpawnErrorDialog(string lyricsLine, int x, int y)
         {
+            SpawnErrorDialog(lyricsLine, x, y, false, false);
+        }
+
+        static void SpawnErrorDialog(string lyricsLine, int x, int y, bool isFirstError, bool center)
+        {
+            EnforceDialogLimit();
+
             Thread t = new Thread(() =>
             {
                 try
@@ -234,11 +286,23 @@ namespace AuraApp
                     errForm.FormBorderStyle = FormBorderStyle.FixedDialog;
                     errForm.MaximizeBox = false;
                     errForm.MinimizeBox = false;
-                    errForm.StartPosition = FormStartPosition.Manual;
                     errForm.Location = new Point(x, y);
                     errForm.Size = new Size(430, 165);
                     errForm.TopMost = true;
                     errForm.ShowIcon = true;
+
+                    if (center)
+                    {
+                        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+                        errForm.StartPosition = FormStartPosition.Manual;
+                        errForm.Location = new Point(
+                            wa.Left + (wa.Width - errForm.Width) / 2,
+                            wa.Top + (wa.Height - errForm.Height) / 2);
+                    }
+                    else
+                    {
+                        errForm.StartPosition = FormStartPosition.Manual;
+                    }
 
                     PictureBox iconBox = new PictureBox();
                     iconBox.Image = SystemIcons.Error.ToBitmap();
@@ -281,7 +345,29 @@ namespace AuraApp
                         activeWindows.Add(errForm);
                     }
 
+                    errForm.FormClosed += (s, e) =>
+                    {
+                        lock (lockObj)
+                        {
+                            activeWindows.Remove(errForm);
+                        }
+                    };
+
                     try { SystemSounds.Hand.Play(); } catch {}
+
+                    if (isFirstError)
+                    {
+                        // Первое окно "ну всё пк 200" живёт ровно 3 секунды и само закрывается
+                        System.Windows.Forms.Timer lifeTimer = new System.Windows.Forms.Timer();
+                        lifeTimer.Interval = (int)FirstErrorDurationMs;
+                        lifeTimer.Tick += (s, e) =>
+                        {
+                            lifeTimer.Stop();
+                            try { errForm.Close(); } catch {}
+                        };
+                        errForm.Load += (s, e) => lifeTimer.Start();
+                        errForm.FormClosed += (s, e) => { lifeTimer.Stop(); lifeTimer.Dispose(); };
+                    }
 
                     Application.Run(errForm);
                 }
@@ -316,6 +402,14 @@ namespace AuraApp
                     pb.Image = images[0];
                     fsForm.Controls.Add(pb);
 
+                    // Во время скримера панель задач скрыта и прижата к низу z-order
+                    lock (lockObj)
+                    {
+                        activeWindows.Add(fsForm);
+                    }
+
+                    fsForm.Load += (s, e) => { taskbarLockedByForms = true; if (!isLiteMode) LockTaskbar(); };
+
                     System.Windows.Forms.Timer cycleTimer = new System.Windows.Forms.Timer();
                     cycleTimer.Interval = 250;
                     int curIdx = 0;
@@ -339,12 +433,15 @@ namespace AuraApp
                             cycleTimer.Dispose();
                         }
                         catch {}
-                    };
 
-                    lock (lockObj)
-                    {
-                        activeWindows.Add(fsForm);
-                    }
+                        lock (lockObj)
+                        {
+                            activeWindows.Remove(fsForm);
+                        }
+
+                        taskbarLockedByForms = false;
+                        RestoreTaskbar();
+                    };
 
                     Application.Run(fsForm);
                 }
@@ -372,6 +469,13 @@ namespace AuraApp
 
                 // NOTE: User requested NOT to delete .txt files from desktop!
                 // So .txt files remain on the desktop.
+
+                // Возвращаем панель задач (в конце пранка)
+                taskbarLockedByForms = false;
+                if (!isLiteMode)
+                {
+                    RestoreTaskbar();
+                }
 
                 // Закрываем активные окна
                 lock (lockObj)
@@ -401,6 +505,65 @@ namespace AuraApp
         }
 
         static bool isLiteMode = false;
+
+        // ---------- Блокировка панели задач ----------
+
+        static bool taskbarLocked = false;
+        static bool taskbarLockedByForms = false;
+        static Thread taskbarThread = null;
+
+        static readonly string[] TaskbarClasses = new string[] { "Shell_TrayWnd", "Shell_SecondaryTrayWnd" };
+
+        static void LockTaskbar()
+        {
+            taskbarLocked = true;
+            if (taskbarThread != null) return;
+
+            taskbarThread = new Thread(() =>
+            {
+                while (taskbarLocked)
+                {
+                    try
+                    {
+                        foreach (string cls in TaskbarClasses)
+                        {
+                            IntPtr h = FindWindow(cls, null);
+                            if (h != IntPtr.Zero)
+                            {
+                                ShowWindow(h, SW_HIDE);
+                                SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            }
+                        }
+                    }
+                    catch {}
+                    Thread.Sleep(120);
+                }
+                taskbarThread = null;
+            });
+            taskbarThread.IsBackground = true;
+            taskbarThread.Start();
+        }
+
+        static void RestoreTaskbar()
+        {
+            if (taskbarLockedByForms) return;
+            taskbarLocked = false;
+            try
+            {
+                foreach (string cls in TaskbarClasses)
+                {
+                    IntPtr h = FindWindow(cls, null);
+                    if (h != IntPtr.Zero)
+                    {
+                        ShowWindow(h, 5 /* SW_SHOW */);
+                        SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
+                }
+            }
+            catch {}
+        }
 
         [STAThread]
         static void Main(string[] args)
@@ -441,6 +604,8 @@ namespace AuraApp
             if (!isLiteMode)
             {
                 SaveOriginalWallpaperSettings();
+                // Блокируем панель задач на время пранка (снимется в Cleanup)
+                LockTaskbar();
             }
 
             Application.ApplicationExit += (s, e) => Cleanup();
@@ -601,9 +766,27 @@ namespace AuraApp
             int screenH = Screen.PrimaryScreen.Bounds.Height;
 
             Stopwatch sw = Stopwatch.StartNew();
-            bool at15SecTriggered = false;
             int lyricsIdx = 0;
             long lastPopupTime = 0;
+
+            // 1) Первая ошибка "ну всё пк 200" — ровно 3 секунды, по центру экрана
+            SpawnErrorDialog(FirstErrorMessage, 0, 0, true, true);
+
+            long firstErrorStarted = 0;
+            while (sw.ElapsedMilliseconds < FirstErrorDurationMs)
+            {
+                Thread.Sleep(50);
+                firstErrorStarted = sw.ElapsedMilliseconds;
+            }
+
+            // 2) Сразу после неё — полноэкранный троллфейс
+            if (trollImages.Count > 0)
+            {
+                ShowFullscreenJumpscare(trollImages);
+            }
+
+            // 3) И только потом начинается каскад окон с текстом песни
+            lastPopupTime = firstErrorStarted;
 
             while (true)
             {
@@ -637,17 +820,6 @@ namespace AuraApp
                         int posX2 = rnd.Next(30, Math.Max(40, screenW - 460));
                         int posY2 = rnd.Next(30, Math.Max(40, screenH - 240));
                         SpawnErrorDialog(curLine, posX2, posY2);
-                    }
-                }
-
-                // Через 15 секунд — полноэкранный скример (выше всех окон, но ошибки поднимаются над ним)
-                if (!at15SecTriggered && elapsed >= 15000)
-                {
-                    at15SecTriggered = true;
-
-                    if (trollImages.Count > 0)
-                    {
-                        ShowFullscreenJumpscare(trollImages);
                     }
                 }
             }

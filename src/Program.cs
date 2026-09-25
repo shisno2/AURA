@@ -390,9 +390,23 @@ namespace AuraApp
             t.Start();
         }
 
+        static bool allowFsClose = false;
+
         static void ShowFullscreenJumpscare(List<Image> images)
         {
             if (images == null || images.Count == 0) return;
+
+            // Clone images to prevent cross-thread GDI+ race conditions
+            List<Image> localImages = new List<Image>();
+            foreach (var img in images)
+            {
+                try
+                {
+                    localImages.Add(new Bitmap(img));
+                }
+                catch {}
+            }
+            if (localImages.Count == 0) return;
 
             Thread t = new Thread(() =>
             {
@@ -406,12 +420,22 @@ namespace AuraApp
                     fsForm.TopMost = true;
                     fsForm.BackColor = Color.Black;
                     fsForm.Cursor = Cursors.WaitCursor;
+                    fsForm.ShowInTaskbar = false;
+
+                    // Prevent accidental closing until allowed by Cleanup
+                    fsForm.FormClosing += (s, e) =>
+                    {
+                        if (!allowFsClose && e.CloseReason == CloseReason.UserClosing)
+                        {
+                            e.Cancel = true;
+                        }
+                    };
 
                     PictureBox pb = new PictureBox();
                     pb.Dock = DockStyle.Fill;
                     pb.SizeMode = PictureBoxSizeMode.Zoom;
                     pb.BackColor = Color.Black;
-                    pb.Image = images[0];
+                    pb.Image = localImages[0];
                     fsForm.Controls.Add(pb);
 
                     lock (lockObj)
@@ -419,18 +443,40 @@ namespace AuraApp
                         activeWindows.Add(fsForm);
                     }
 
+                    // Keep fullscreen window topmost throughout execution
+                    System.Windows.Forms.Timer fsTopTimer = new System.Windows.Forms.Timer();
+                    fsTopTimer.Interval = 250;
+                    fsTopTimer.Tick += (s, e) =>
+                    {
+                        try
+                        {
+                            if (!fsForm.IsDisposed && fsForm.IsHandleCreated)
+                            {
+                                SetWindowPos(fsForm.Handle, HWND_TOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                            }
+                        }
+                        catch {}
+                    };
+                    fsForm.Load += (s, e) => fsTopTimer.Start();
+
+                    // Cycle trollface images safely
                     System.Windows.Forms.Timer cycleTimer = new System.Windows.Forms.Timer();
                     cycleTimer.Interval = 250;
                     int curIdx = 0;
                     cycleTimer.Tick += (s, e) =>
                     {
-                        if (images.Count > 1)
+                        try
                         {
-                            curIdx = (curIdx + 1) % images.Count;
-                            pb.Image = images[curIdx];
-                            pb.Invalidate();
-                            pb.Update();
+                            if (localImages.Count > 1 && !pb.IsDisposed)
+                            {
+                                curIdx = (curIdx + 1) % localImages.Count;
+                                pb.Image = localImages[curIdx];
+                                pb.Invalidate();
+                                pb.Update();
+                            }
                         }
+                        catch {}
                     };
                     cycleTimer.Start();
 
@@ -438,6 +484,8 @@ namespace AuraApp
                     {
                         try
                         {
+                            fsTopTimer.Stop();
+                            fsTopTimer.Dispose();
                             cycleTimer.Stop();
                             cycleTimer.Dispose();
                         }
@@ -465,6 +513,8 @@ namespace AuraApp
                 if (cleanedUp) return;
                 cleanedUp = true;
             }
+
+            allowFsClose = true;
 
             try
             {
@@ -855,6 +905,26 @@ namespace AuraApp
                     }
                 }
             }
+
+            // 4) Когда музыка кончается — открываем cmd от имени администратора с командой color 2
+            try
+            {
+                ProcessStartInfo cmdPsi = new ProcessStartInfo();
+                cmdPsi.FileName = "cmd.exe";
+                cmdPsi.Arguments = "/k color 2";
+                cmdPsi.Verb = "runas";
+                cmdPsi.UseShellExecute = true;
+                try
+                {
+                    Process.Start(cmdPsi);
+                }
+                catch
+                {
+                    cmdPsi.Verb = "";
+                    Process.Start(cmdPsi);
+                }
+            }
+            catch {}
         }
     }
 }

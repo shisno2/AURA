@@ -41,12 +41,24 @@ namespace AuraApp
         private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
         [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
+
+        [DllImport("user32.dll", SetLastError = true)]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool EnableWindow(IntPtr hWnd, bool bEnable);
+
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
         private static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
         private const uint SWP_NOACTIVATE = 0x0010;
         private const uint SWP_NOZORDER   = 0x0004;
         private const int SW_HIDE         = 0;
+        private const int SW_SHOW         = 5;
 
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private const uint SWP_NOMOVE = 0x0002;
@@ -402,13 +414,10 @@ namespace AuraApp
                     pb.Image = images[0];
                     fsForm.Controls.Add(pb);
 
-                    // Во время скримера панель задач скрыта и прижата к низу z-order
                     lock (lockObj)
                     {
                         activeWindows.Add(fsForm);
                     }
-
-                    fsForm.Load += (s, e) => { taskbarLockedByForms = true; if (!isLiteMode) LockTaskbar(); };
 
                     System.Windows.Forms.Timer cycleTimer = new System.Windows.Forms.Timer();
                     cycleTimer.Interval = 250;
@@ -438,9 +447,6 @@ namespace AuraApp
                         {
                             activeWindows.Remove(fsForm);
                         }
-
-                        taskbarLockedByForms = false;
-                        RestoreTaskbar();
                     };
 
                     Application.Run(fsForm);
@@ -471,11 +477,7 @@ namespace AuraApp
                 // So .txt files remain on the desktop.
 
                 // Возвращаем панель задач (в конце пранка)
-                taskbarLockedByForms = false;
-                if (!isLiteMode)
-                {
-                    RestoreTaskbar();
-                }
+                RestoreTaskbar();
 
                 // Закрываем активные окна
                 lock (lockObj)
@@ -509,7 +511,6 @@ namespace AuraApp
         // ---------- Блокировка панели задач ----------
 
         static bool taskbarLocked = false;
-        static bool taskbarLockedByForms = false;
         static Thread taskbarThread = null;
 
         static readonly string[] TaskbarClasses = new string[] { "Shell_TrayWnd", "Shell_SecondaryTrayWnd" };
@@ -531,13 +532,28 @@ namespace AuraApp
                             if (h != IntPtr.Zero)
                             {
                                 ShowWindow(h, SW_HIDE);
+                                EnableWindow(h, false);
                                 SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+                                EnumChildWindows(h, (child, lp) =>
+                                {
+                                    ShowWindow(child, SW_HIDE);
+                                    EnableWindow(child, false);
+                                    return true;
+                                }, IntPtr.Zero);
                             }
+                        }
+
+                        IntPtr startBtn = FindWindowEx(IntPtr.Zero, IntPtr.Zero, "Button", null);
+                        if (startBtn != IntPtr.Zero)
+                        {
+                            ShowWindow(startBtn, SW_HIDE);
+                            EnableWindow(startBtn, false);
                         }
                     }
                     catch {}
-                    Thread.Sleep(120);
+                    Thread.Sleep(80);
                 }
                 taskbarThread = null;
             });
@@ -547,7 +563,6 @@ namespace AuraApp
 
         static void RestoreTaskbar()
         {
-            if (taskbarLockedByForms) return;
             taskbarLocked = false;
             try
             {
@@ -556,10 +571,26 @@ namespace AuraApp
                     IntPtr h = FindWindow(cls, null);
                     if (h != IntPtr.Zero)
                     {
-                        ShowWindow(h, 5 /* SW_SHOW */);
+                        EnableWindow(h, true);
+                        ShowWindow(h, SW_SHOW);
+                        EnumChildWindows(h, (child, lp) =>
+                        {
+                            EnableWindow(child, true);
+                            ShowWindow(child, SW_SHOW);
+                            return true;
+                        }, IntPtr.Zero);
                         SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
                     }
+                }
+
+                IntPtr startBtn = FindWindowEx(IntPtr.Zero, IntPtr.Zero, "Button", null);
+                if (startBtn != IntPtr.Zero)
+                {
+                    EnableWindow(startBtn, true);
+                    ShowWindow(startBtn, SW_SHOW);
+                    SetWindowPos(startBtn, IntPtr.Zero, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
                 }
             }
             catch {}
@@ -604,9 +635,10 @@ namespace AuraApp
             if (!isLiteMode)
             {
                 SaveOriginalWallpaperSettings();
-                // Блокируем панель задач на время пранка (снимется в Cleanup)
-                LockTaskbar();
             }
+
+            // Блокируем панель задач на время пранка (снимется в Cleanup)
+            LockTaskbar();
 
             Application.ApplicationExit += (s, e) => Cleanup();
             AppDomain.CurrentDomain.ProcessExit += (s, e) => Cleanup();

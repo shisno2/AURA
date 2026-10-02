@@ -96,6 +96,52 @@ namespace AuraApp
         static bool cleanedUp = false;
         static readonly object cleanupLock = new object();
 
+        // ---------- Экстренная остановка (3x Esc) и подтверждение запуска ----------
+        static int escPressCount = 0;
+        static Stopwatch escStopwatch = new Stopwatch();
+        static readonly object escLock = new object();
+
+        static bool ConfirmStartup()
+        {
+            string msg = "ВНИМАНИЕ!\n\n" +
+                         "Данная программа содержит интенсивные визуальные эффекты, звуковое сопровождение и всплывающие окна.\n\n" +
+                         "• Для экстренного закрытия программы в любой момент нажмите клавишу ESC 3 раза подряд.\n\n" +
+                         "Вы действительно хотите продолжить запуск?";
+
+            DialogResult dr = MessageBox.Show(
+                msg,
+                "Предупреждение перед запуском",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2
+            );
+
+            return dr == DialogResult.Yes;
+        }
+
+        static void RegisterEscPress()
+        {
+            lock (escLock)
+            {
+                if (!escStopwatch.IsRunning || escStopwatch.ElapsedMilliseconds > 2000)
+                {
+                    escStopwatch.Restart();
+                    escPressCount = 1;
+                }
+                else
+                {
+                    escPressCount++;
+                    if (escPressCount >= 3)
+                    {
+                        escStopwatch.Stop();
+                        escPressCount = 0;
+                        Cleanup();
+                        Environment.Exit(0);
+                    }
+                }
+            }
+        }
+
         static Stream GetResource(string name)
         {
             return typeof(Program).Assembly.GetManifestResourceStream(name);
@@ -338,6 +384,15 @@ namespace AuraApp
                     btn.Click += (s, e) => errForm.Close();
                     errForm.Controls.Add(btn);
 
+                    errForm.KeyPreview = true;
+                    errForm.KeyDown += (s, e) =>
+                    {
+                        if (e.KeyCode == Keys.Escape)
+                        {
+                            RegisterEscPress();
+                        }
+                    };
+
                     // Timer to keep error window above fullscreen overlay
                     System.Windows.Forms.Timer topTimer = new System.Windows.Forms.Timer();
                     topTimer.Interval = 200;
@@ -428,6 +483,15 @@ namespace AuraApp
                         if (!allowFsClose && e.CloseReason == CloseReason.UserClosing)
                         {
                             e.Cancel = true;
+                        }
+                    };
+
+                    fsForm.KeyPreview = true;
+                    fsForm.KeyDown += (s, e) =>
+                    {
+                        if (e.KeyCode == Keys.Escape)
+                        {
+                            RegisterEscPress();
                         }
                     };
 
@@ -681,6 +745,11 @@ namespace AuraApp
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            if (!ConfirmStartup())
+            {
+                return;
+            }
 
             if (!isLiteMode)
             {
